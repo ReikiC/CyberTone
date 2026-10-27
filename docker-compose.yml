@@ -1,0 +1,40 @@
+name: cybertone
+
+services:
+  # Zero-shot cloning service. Linux + NVIDIA only (CosyVoice2 is torch/CUDA);
+  # on a Mac, leave this off and run the CLI with --backend mock.
+  tts:
+    build: ./services/cosyvoice
+    profiles: ["gpu"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/opt/CosyVoice/pretrained_models
+      - ./refs:/refs:ro
+    environment:
+      CYBERTONE_MODEL: /opt/CosyVoice/pretrained_models/CosyVoice2-0.5B
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+
+  # One-shot renderer. `docker compose run --rm cli run Introduction.mp3 --backend cosyvoice`
+  cli:
+    build: .
+    volumes:
+      - .:/data
+    working_dir: /data
+    environment:
+      CYBERTONE_TTS_URL: http://tts:8000
+      CYBERTONE_TTS_REF: /data/refs/ref.wav
+      UV_CACHE_DIR: /data/.uv-cache
+    entrypoint: ["cybertone"]
+    command: ["run", "Introduction.mp3", "--backend", "mock"]

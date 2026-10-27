@@ -1,0 +1,41 @@
+# Copy to cybertone.toml and pass with `--config cybertone.toml`.
+# Every field can also be set from the environment as CYBERTONE_<NAME>,
+# e.g. CYBERTONE_TTS_URL=http://gpu-box:8000
+
+speed = 2.0
+work = "work"
+
+# speech rate envelope: r_max is the naturalness cliff, measure it on your own voice
+r_min = 1.0
+r_max = 1.75
+jitter = 0.10
+
+# pause budget: silence is spent first, and paragraph breaks stay longer
+gap_scale = 0.40
+gap_min = 0.05
+gap_max = 0.22
+paragraph_gap = 0.35
+paragraph_threshold = 0.55
+
+# sentence building
+merge_gap = 0.60      # pauses shorter than this stay inside one sentence
+max_sentence = 12.0
+min_speech = 0.20
+min_silence = 0.18
+
+# render
+stem_lufs = -20.0
+loudness_lufs = -16.0
+peak_ceiling_db = -1.0
+room_tone_db = -42.0
+
+# tts
+backend = "mock"      # mock | cosyvoice
+tts_url = "http://127.0.0.1:8000"
+tts_ref = "refs/ref.wav"
+tts_seed = 42
+fit_iters = 4
+
+# asr (optional)
+asr_model = "small"
+asr_language = "zh"

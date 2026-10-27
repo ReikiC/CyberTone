@@ -1,0 +1,43 @@
+[project]
+name = "cybertone"
+version = "0.1.0"
+description = "Per-sentence voice-cloned resynthesis: 2x playback without shortening words"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "soundfile>=0.12.1",
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.0"]
+
+[project.scripts]
+cybertone = "cybertone.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cybertone"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
