@@ -26,3 +26,14 @@ def test_anchor_never_overlaps_when_a_sentence_overruns():
     rows = [Row(0.0), Row(1.0)]
     starts, _total = placements(rows, [3.0, 1.0], [0, 0, 0], 5.0, 2.0, "anchor")
     assert starts[1] >= starts[0] + 3.0
+
+
+def test_transcript_cache_key_depends_on_model(tmp_path):
+    from cybertone.cli import _transcript_cache
+    from cybertone.config import Settings
+
+    f = tmp_path / "a.mp3"
+    f.write_bytes(b"x" * 16)
+    a = _transcript_cache(Settings(asr_model="small"), f)
+    b = _transcript_cache(Settings(asr_model="large-v3"), f)
+    assert a != b

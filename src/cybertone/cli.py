@@ -36,7 +36,9 @@ def _cfg(config: Path | None, speed: float | None, backend: str | None) -> Setti
 def _transcript_cache(cfg: Settings, input: Path) -> Path:
     import hashlib
 
-    key = hashlib.sha1(f"{input.resolve()}:{input.stat().st_size}".encode()).hexdigest()[:10]
+    # model and language belong in the key: switching them must not reuse a stale transcript
+    raw = f"{input.resolve()}:{input.stat().st_size}:{cfg.asr_model}:{cfg.asr_language}"
+    key = hashlib.sha1(raw.encode()).hexdigest()[:10]
     return cfg.work / f"transcript-{key}.json"
 
 
