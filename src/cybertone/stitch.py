@@ -71,7 +71,10 @@ def assemble(
     else:
         tone = audio.quietest_span(source, sr, 2.0)
         bed = audio.loop_to(tone, n)
-    target_rms = 10 ** ((cfg.room_tone_db or -120.0) / 20.0)
+    # the bed must sit below the stems' own noise, otherwise it becomes the hiss
+    stem_floor = float(np.median([audio.noise_floor_db(w, sr) for w in wavs])) if wavs else -90.0
+    bed_db = min(cfg.room_tone_db or -120.0, stem_floor - 6.0)
+    target_rms = 10 ** (bed_db / 20.0)
     cur_rms = float(np.sqrt(np.mean(np.square(bed, dtype=np.float64)))) if bed.size else 0.0
     # never amplify a digital-silence span into a loud noise floor: 18 dB is plenty
     if cur_rms > 1e-9 and bed.any():

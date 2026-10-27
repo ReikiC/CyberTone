@@ -68,20 +68,20 @@ def test_wav_roundtrip(tmp_path):
     assert np.allclose(y, x, atol=1e-5)
 
 
-def test_denoise_lowers_floor_without_touching_level():
+def test_denoise_lowers_floor_at_equal_loudness():
+    """The operational metric: after loudness normalisation the floor must drop."""
     t = np.arange(SR * 4) / SR
     speech = (0.3 * np.sin(2 * np.pi * 180 * t) * ((t % 1.0) < 0.5)).astype(np.float32)
     noisy = speech + np.random.default_rng(0).normal(0, 0.01, SR * 4).astype(np.float32)
-    clean = audio.denoise(noisy, SR, 1.2)
-    assert audio.noise_floor_db(clean, SR) < audio.noise_floor_db(noisy, SR) - 3.0
-    assert audio.integrated_loudness(clean, SR) == pytest.approx(
-        audio.integrated_loudness(noisy, SR), abs=1.0
-    )
+    clean = audio.denoise(noisy, SR, 0.9)
+    a = audio.normalize_loudness(noisy, SR, -20.0, limit=False)
+    b = audio.normalize_loudness(clean, SR, -20.0, limit=False)
+    assert audio.noise_floor_db(b, SR) < audio.noise_floor_db(a, SR) - 5.0
 
 
 def test_denoise_is_transparent_at_zero_strength():
     x = np.random.default_rng(3).normal(0, 0.05, SR).astype(np.float32)
-    assert np.allclose(audio.denoise(x, SR, 0.0), x, atol=1e-4)
+    assert np.array_equal(audio.denoise(x, SR, 0.0), x)
 
 
 def test_highpass_kills_rumble_keeps_speech_band():

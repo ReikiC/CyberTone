@@ -46,7 +46,7 @@ class Settings(BaseModel):
     peak_ceiling_db: float = -1.0
     stem_lufs: float | None = -20.0
     clean_tts: bool = True
-    denoise_strength: float = 1.2
+    denoise_strength: float = 0.9
     hp_hz: float = 70.0
     placement: str = "flow"  # flow | anchor
 

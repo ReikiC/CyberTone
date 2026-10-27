@@ -25,7 +25,7 @@ min_silence = 0.18
 
 # render
 clean_tts = true        # highpass -> spectral denoise -> trim, per stem
-denoise_strength = 1.2
+denoise_strength = 0.9   # 0 disables; 1.0 is maximum suppression
 hp_hz = 70.0
 placement = "flow"      # flow | anchor
 stem_lufs = -20.0
