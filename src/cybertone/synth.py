@@ -35,10 +35,15 @@ class Backend(Protocol):
     def render(self, trig: Trigger, speed: float) -> np.ndarray: ...
 
 
-class MockBackend:
-    """Time-stretch the source sentence. speed=2.0 -> half length, same pitch."""
+class RetimeBackend:
+    """Re-times the ORIGINAL sentence with WSOLA.
 
-    name = "mock"
+    This is a timing scaffold, not a voice model: it inherits the source delivery and
+    only changes rate. Use it to validate segmentation/budget/mux before paying for a
+    TTS run — never as the final render.
+    """
+
+    name = "retime"
     exact = True
 
     def __init__(self, source: np.ndarray, sr: int) -> None:
@@ -52,22 +57,29 @@ class MockBackend:
         return audio.time_stretch(seg, speed, self.sr)
 
 
-class CosyVoiceBackend:
-    """Zero-shot clone over HTTP. The service owns the model, the client owns timing."""
+class HTTPServiceBackend:
+    """Zero-shot clone over HTTP (CosyVoice2 / F5-TTS / anything with /tts).
 
-    name = "cosyvoice"
+    The service owns the model; the client owns timing.
+    """
+
     exact = False
 
-    def __init__(self, cfg: Settings) -> None:
+    def __init__(self, cfg: Settings, name: str = "service") -> None:
+        self.name = name
         self.cfg = cfg
         self.sr = cfg.sr
+        self.ref_text = cfg.tts_ref_text
         self._ref_b64 = ""
         if cfg.tts_ref:
             ref, _ = audio.load(cfg.tts_ref, cfg.sr)
             buf = io.BytesIO()
             sf.write(buf, ref, cfg.sr, format="WAV", subtype="PCM_16")
             self._ref_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        self._client = httpx.Client(base_url=cfg.tts_url, timeout=180.0)
+            side = Path(cfg.tts_ref).with_suffix(".txt")
+            if not self.ref_text and side.exists():
+                self.ref_text = side.read_text(encoding="utf-8").strip()
+        self._client = httpx.Client(base_url=cfg.tts_url, timeout=600.0)
 
     def render(self, trig: Trigger, speed: float) -> np.ndarray:
         if not trig.text:
@@ -80,6 +92,8 @@ class CosyVoiceBackend:
             "temperature": self.cfg.tts_temperature,
             "sample_rate": self.cfg.sr,
             "ref_wav_b64": self._ref_b64,
+            "ref_text": self.ref_text,
+            "nfe_step": self.cfg.tts_nfe,
         }
         resp = self._client.post("/tts", json=payload)
         resp.raise_for_status()
@@ -87,14 +101,19 @@ class CosyVoiceBackend:
         mono = wav.mean(axis=1).astype(np.float32)
         if sr != self.sr:
             mono = audio.resample(mono, sr, self.sr)
+        # TTS pads with silence; measuring it as speech would eat the window budget
+        mono = audio.trim_silence(mono, self.sr, -40.0, 30.0)
         return audio.fade(mono, self.sr, 3.0)
 
 
+SERVICE_BACKENDS = {"service", "cosyvoice", "cosyvoice2", "f5tts", "f5"}
+
+
 def make_backend(name: str, cfg: Settings, source: np.ndarray, sr: int) -> Backend:
-    if name == "mock":
-        return MockBackend(source, sr)
-    if name in ("cosyvoice", "cosyvoice2"):
-        return CosyVoiceBackend(cfg)
+    if name in ("retime", "mock"):
+        return RetimeBackend(source, sr)
+    if name in SERVICE_BACKENDS:
+        return HTTPServiceBackend(cfg, name)
     raise ValueError(f"unknown backend: {name}")
 
 
@@ -158,15 +177,31 @@ def fit(
             if d >= row.win_min:
                 break
             hi = mid
-        if wav is None:  # even r_max overruns: synth then squeeze the residual
+        if wav is not None:
+            # one secant step: TTS length responds almost linearly to speed, so this
+            # usually lands in the window instead of relying on residual stretching
+            dur = wav.size / cfg.sr
+            if dur > row.win_max * 1.01 and best * dur / row.win_max <= cfg.r_max:
+                trial = min(cfg.r_max, best * dur / row.win_max)
+                cand = _render(backend, trig, trial, cfg, cache)
+                if cand.size / cfg.sr <= row.win_max:
+                    best, wav = trial, cand
+        if wav is None:  # even r_max overruns
             best = cfg.r_max
             wav = _render(backend, trig, best, cfg, cache)
-            d = wav.size / cfg.sr
-            factor = d / max(row.win_max, 1e-3)
+
+        dur = wav.size / cfg.sr
+        if dur > row.win_max:
+            factor = dur / max(row.win_max, 1e-3)
             wav = audio.time_stretch(wav, factor, cfg.sr)
-            degraded = True
+            degraded = factor > 1.03
 
     dur = wav.size / cfg.sr
+    if cfg.clean_tts and not backend.exact:
+        wav = audio.highpass(wav, cfg.sr, cfg.hp_hz)
+        wav = audio.denoise(wav, cfg.sr, cfg.denoise_strength)
+        wav = audio.trim_silence(wav, cfg.sr, -45.0, 20.0)
+        dur = wav.size / cfg.sr
     if cfg.stem_lufs is not None and not backend.exact:
         # TTS loudness drifts sentence to sentence; even it out before assembly
         wav = audio.normalize_loudness(wav, cfg.sr, cfg.stem_lufs, cfg.peak_ceiling_db)
@@ -182,6 +217,7 @@ def fit(
             "dur_err": round(dur - row.win_max, 4),
             "peak_db": round(audio.peak_db(wav), 2),
             "lufs": audio.integrated_loudness(wav, cfg.sr),
+            "floor_db": round(audio.noise_floor_db(wav, cfg.sr), 1),
             "overrun": dur > row.win_max + 0.02,
         },
     )
@@ -190,29 +226,61 @@ def fit(
 
 
 def make_reference(
-    source: np.ndarray, sr: int, triggers: list[Trigger], dur: float = 8.0
-) -> np.ndarray:
-    """Pick a clean, energetic stretch of the speaker for zero-shot cloning."""
+    source: np.ndarray, sr: int, triggers: list[Trigger], dur: float = 8.0, clean: bool = True
+) -> tuple[np.ndarray, str]:
+    """Pick 5-8 s of continuous, clean speech for zero-shot cloning.
+
+    Single sentences are usually too short (2-3 s) for a stable timbre embedding, so
+    consecutive triggers are merged first, and the transcript comes straight from the
+    manifest instead of a second ASR pass.
+    """
     import numpy as np
 
-    cands = [t for t in triggers if 2.0 <= t.dur <= 14.0]
-    if not cands:
-        cands = triggers
-    if not cands:
-        return source[: int(dur * sr)].copy()
-    scored = []
-    for t in cands:
-        a, b = int(t.src_in * sr), int(t.src_out * sr)
-        seg = source[a:b]
-        if seg.size < int(0.5 * sr):
-            continue
-        scored.append((audio.rms_db(seg) - 0.5 * abs(t.dur - 6.0), t))
-    scored.sort(key=lambda x: -x[0])
-    t = scored[0][1]
-    a = int(t.src_in * sr)
-    want = int(min(dur, t.dur) * sr)
-    seg = source[a : a + want]
-    return np.ascontiguousarray(seg.astype(np.float32))
+    if not triggers:
+        return np.ascontiguousarray(source[: int(dur * sr)]), ""
+
+    groups: list[tuple[float, float, list[Trigger]]] = []
+    i, n = 0, len(triggers)
+    while i < n:
+        j = i
+        while j + 1 < n and triggers[j + 1].src_out - triggers[i].src_in <= dur * 1.05:
+            j += 1
+        span = triggers[j].src_out - triggers[i].src_in
+        if j > i and span > dur * 1.05:
+            j, span = j - 1, triggers[j - 1].src_out - triggers[i].src_in
+        if 2.0 <= span <= dur * 1.05:
+            groups.append((triggers[i].src_in, triggers[j].src_out, triggers[i : j + 1]))
+            i = j + 1
+        else:
+            i += 1
+
+    if not groups:
+        groups = [(t.src_in, t.src_out, [t]) for t in triggers if t.dur >= 1.0] or [
+            (triggers[0].src_in, triggers[0].src_out, [triggers[0]])
+        ]
+
+    def score(g: tuple[float, float, list[Trigger]]) -> float:
+        a, b, _ = g
+        seg = source[int(a * sr) : int(b * sr)]
+        return audio.rms_db(seg) - 0.4 * abs((b - a) - dur)
+
+    best = max(groups, key=score)
+    a, b, used = best
+    want = int(min(dur, b - a) * sr)
+    mid = int(((a + b) / 2) * sr)
+    start = max(int(a * sr), mid - want // 2)
+    seg = source[start : start + want]
+    seg = np.ascontiguousarray(seg.astype(np.float32))
+    if clean:
+        # the cloner imitates the prompt channel, so its hiss ends up in every sentence
+        seg = audio.denoise(audio.highpass(seg, sr, 70.0), sr, 1.0)
+    return seg, _reference_text(used)
+
+
+def _reference_text(triggers: list[Trigger]) -> str:
+    from .triggers import _join
+
+    return _join([t.text for t in triggers])
 
 
 def save_manifest(stems: list[Stem], path: Path) -> None:

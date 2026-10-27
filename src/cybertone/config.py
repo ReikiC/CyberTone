@@ -41,19 +41,25 @@ class Settings(BaseModel):
 
     # --- render ---
     fade_ms: float = 5.0
-    room_tone_db: float = -42.0
+    room_tone_db: float | None = -58.0
     loudness_lufs: float = -16.0
     peak_ceiling_db: float = -1.0
     stem_lufs: float | None = -20.0
+    clean_tts: bool = True
+    denoise_strength: float = 1.2
+    hp_hz: float = 70.0
+    placement: str = "flow"  # flow | anchor
 
     # --- tts ---
-    backend: str = "mock"
+    backend: str = "retime"
     tts_url: str = "http://127.0.0.1:8000"
     tts_model: str = "cosyvoice2"
     tts_seed: int = 42
     tts_temperature: float = 0.70
     tts_ref: Path | None = None
-    fit_iters: int = 4
+    tts_ref_text: str = ""
+    fit_iters: int = 3
+    tts_nfe: int = 16
 
     # --- asr ---
     asr_model: str = "small"

@@ -42,7 +42,7 @@ pause budget  15.38s
 needed rate b 1.534x      feasible: yes
 ```
 
-用 `mock` 后端（分句原声重排，不换音色）跑完整链路后的客观结果：
+用 `retime` 后端（分句原声重排，不换音色）跑完整链路后的客观结果：
 
 | | 原片 | CyberTone 输出 | 全片 atempo=2 基线 |
 |---|---|---|---|
@@ -75,7 +75,7 @@ uv sync --extra asr     # 加 faster-whisper，拿到文字与词级时间戳
 # 1. 先量一下：这一步决定后面值不值得做
 uv run cybertone inspect Introduction.mp3 --asr
 
-# 2. 全链路（mock 后端，不需要 GPU）
+# 2. 全链路（retime 后端，不需要模型，只验证时间轴）
 uv run cybertone run Introduction.mp3 --asr
 
 # 3. 生成 A/B 对照：全片硬压 2x 的版本
@@ -125,6 +125,10 @@ uv run cybertone video    input.mp4 work/out/master.wav -o work/out/out.mp4
 | `max_sentence` | 12.0 | 单句上限，超了强制切分 |
 | `gap_scale` / `gap_max` | 0.40 / 0.22 | 停顿保留比例与上限，段落处单独用 `paragraph_gap` |
 | `stem_lufs` | −20 | 逐句响度归一（仅 TTS 后端），压掉句间音量抖动 |
+| `clean_tts` | true | TTS 后处理链：高通 70 Hz → 谱减降噪 → 裁静音 |
+| `denoise_strength` | 1.2 | 降噪强度，过大会有“水声”，1.0–1.5 之间调 |
+| `room_tone_db` | −58 | 铺底噪电平；设 ≤ −90 直接关掉，用数字静音 |
+| `placement` | flow | `flow` 尽量吃满停顿；`anchor` 把每句钉在 `src/speed` 上保 A/V 对齐 |
 | `loudness_lufs` / `peak_ceiling_db` | −16 / −1 | 母带目标与限幅天花板 |
 
 ## 架构
@@ -142,46 +146,97 @@ uv run cybertone video    input.mp4 work/out/master.wav -o work/out/out.mp4
 
 ## TTS 后端（学音色）
 
-`mock` 后端用原声分句重排，是为了让你**先验证时间轴**，它不换音色。
+三种后端，协议一致，换一行配置即可：
 
-真正的克隆走 `services/cosyvoice`（CosyVoice2 零样本，原生 `speed`）：
+| backend | 跑的机器 | 做什么 | 音色 |
+|---|---|---|---|
+| `retime` | 任何机器 | 分句后把**原声**重新定时，不重新合成 | 原声（**会继承原片语速**，只作时间轴脚手架） |
+| `f5tts` | **Mac / MPS**、CPU、CUDA | F5-TTS 零样本克隆，`speed` 原生可控 | 学来的 |
+| `cosyvoice` | Linux + NVIDIA | CosyVoice2 零样本克隆 | 学来的 |
+
+`retime` 只是为了让你先验证切句、预算、字幕和封装——它听起来就是“原声被加速”，
+不要拿它当成品。真正的听感收益来自后两种：**STT 出文本 → TTS 用克隆音色重新发声**。
+
+### Mac 上跑 F5（走 MPS，不需要 NVIDIA）
 
 ```bash
-docker compose --profile gpu up -d tts          # 需要 Linux + NVIDIA
-uv run cybertone ref Introduction.mp3 -o refs/ref.wav
-uv run cybertone run Introduction.mp3 --asr --backend cosyvoice \
-    --config cybertone.toml        # tts_ref = "refs/ref.wav"
+cd services/f5tts && uv sync                 # torch + f5-tts，约 2.5 GB
+uv run uvicorn app:app --port 8000           # 首次请求会下载模型 ~1.3 GB
+
+# 另一个终端，仓库根目录
+uv run cybertone ref Introduction.mp3 -o refs/ref.wav --dur 8
+CYBERTONE_TTS_URL=http://127.0.0.1:8000 \
+  uv run cybertone run clip.wav --asr --backend f5tts --config cybertone.toml
 ```
 
-客户端对每句做**闭环落窗**：以 `r` 二分调用（默认 4 次），测回实际时长，落在
-`[win_min, win_max]` 就停；`r_max` 仍塞不下的句子做 ≤8% 残余拉伸并标 `degraded`。
-缓存键含文本、参考音色、speed、seed，改一句只重跑一句。
+M4 Pro 实测：单句 RTF 3–8（`nfe_step=16`），60 秒片段 6 句共 8 分钟，`degraded` 为 0。
+两个 macOS 专属的坑已经在 `services/f5tts/compat.py` 里绕开：torch 2.14 的
+`torchaudio.load` 会去 dlopen 不存在的 ffmpeg 4.x dylib；F5 的参考音预处理又会去调
+`ffmpeg/ffprobe`。
 
-> Apple silicon 没有 CUDA，CosyVoice2 在 CPU 上慢到不可用。Mac 上要么用 `mock`
-> 验证流程，要么把 `CYBERTONE_TTS_URL` 指向一台 Linux 机器。
+### Linux + GPU（CosyVoice2）
+
+```bash
+docker compose --profile gpu up -d tts
+CYBERTONE_TTS_URL=http://127.0.0.1:8000 uv run cybertone run in.mp4 --asr --backend cosyvoice
+```
+
+客户端对每句做**闭环落窗**：二分 `speed`，测回实际时长，落在 `[win_min, win_max]` 就停；
+再用**割线一步**用实测时长反推需要的 speed 重渲一次（TTS 时长对 speed 近似线性）；
+仍超窗才补 ≤3% 残余拉伸并标 `degraded`。缓存键含文本、参考音色、speed、seed。
+
+## 底噪怎么处理
+
+克隆出来的声音发闷/带嘶声，一般是三个来源叠加，必须分开处理：
+
+1. **参考音把噪声“教”给了模型** —— F5/CosyVoice 都会模仿 prompt 的通道特征，参考音有嘶声，
+   每句都有嘶声。对策：参考音先过 70 Hz 高通 + 谱减降噪再喂（`make_reference` 默认已做）。
+2. **vocoder 自身的高频嘶声** —— 在 stem 上过同一套降噪链，**逐句处理**而不是整轨，
+   这样每句噪声特性一致，拼接处不会“呼吸”。
+3. **铺底噪铺过头** —— 这是最容易翻车的一项：底噪床是用来避免数字静音的，
+   一旦高过 stem 自身噪声，就会全程可闻。
+
+实测（60 秒片段，6 句）：
+
+| | 母带噪声底 | 停顿处电平 |
+|---|---|---|
+| 修复前（床 −42 dB，无降噪） | −39.1 dBFS | −47.2 dBFS |
+| 修复后（床 −58 dB + 逐句降噪） | **−54.6 dBFS** | **−54.6 dBFS** |
+
+顺序很重要：**先降噪，再归一响度**——反过来的话降噪会把归一后的电平又拉下来。
+内置的是谱减（无额外依赖）；素材本身噪声更脏（风扇、键盘、房间混响）时，
+把 `denoise` 换成 DeepFilterNet 只改一处调用，接口一致。
 
 ## 测试
 
 ```bash
-uv run pytest -q      # 19 passed
+uv run pytest -q      # 26 passed
 uv run ruff check src tests
 ```
 
-覆盖：预算求解的可行/不可行分支、窗口单调性、停顿重分配守恒、WSOLA 时长误差（<1%）、
-BS.1770 参考值（−20 dBFS 正弦 ≈ −23 LUFS）、限幅器不靠衰减、VAD 的合并/强切/不重叠。
+覆盖：预算求解的可行/不可行分支、窗口单调性与守恒、`flow`/`anchor` 两种落点、
+WSOLA 时长误差（<1%）、BS.1770 参考值（−20 dBFS 正弦 ≈ −23 LUFS）、限幅器不靠衰减、
+降噪的透明性与降噪量、高通滤除隆隆声、VAD 的合并/强切/不重叠。
 
 ## 已知限制
 
-- `mock` 后端不做音色迁移，听感等同“分句 + 停顿压缩”，可作为质量下限对照。
-- `cosyvoice` 服务镜像需要 GPU 且**未在本机跑通**（无 CUDA）；镜像内含模型下载步骤，首次启动较慢。
+- `retime` 后端不做音色迁移，听感等同“原声 + 停顿压缩”，只作时间轴脚手架。
+- **STT 的 WER 就是最终错误率**：`medium` 会把“Home shot”听成“Homeshot”、把领域词念错，
+  TTS 会一字不落地念出来。走 TTS 后端时用 `asr_model = "large-v3"`，或者人工校对
+  `triggers.jsonl` 里的 `text`。
+- `cosyvoice` 镜像需要 GPU，**未在本机验证**；Mac 上走 `f5tts`（已验证，M4 Pro / MPS）。
 - 逐句合成天然有韵律重置：句间 F0 断层目前只能靠统一参考音 + 固定 seed 缓解，
   尚未实现跨句韵律延续（批量段落合成是下一步）。
-- 视频侧走匀速 `setpts`，2x 下唇形本就不同步；若素材包含屏幕录制，建议改用 EDL 模式。
+- 视频侧走匀速 `setpts`，2x 下唇形本就不同步；`placement=flow` 会相对视频漂移，
+  需要严格对齐就换 `anchor`（代价是停顿只能减半）。
 
 ## 路线图
 
 - [x] 触发节点 / 预算求解 / 闭环落窗 / 缝合 / 封装 / 字幕
-- [x] mock 后端全链路 + A/B 基线
+- [x] `retime` 后端全链路 + A/B 基线
+- [x] Mac 原生 F5-TTS（MPS）零样本克隆，实测 60s→30s、degraded 0
+- [x] 底噪治理：参考音降噪 + 逐句降噪 + 底噪床电平
+- [ ] 整片批量渲染（34 句 / 约 70 分钟）与人工校对回路
 - [ ] 段落级批量合成，减少句间韵律重置
 - [ ] 音素级可压缩性权重（拖音多压、辅音锁死 1.0）
 - [ ] `wer` / `spk_cos` 自动质检闸门

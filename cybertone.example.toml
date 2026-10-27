@@ -24,18 +24,22 @@ min_speech = 0.20
 min_silence = 0.18
 
 # render
+clean_tts = true        # highpass -> spectral denoise -> trim, per stem
+denoise_strength = 1.2
+hp_hz = 70.0
+placement = "flow"      # flow | anchor
 stem_lufs = -20.0
 loudness_lufs = -16.0
 peak_ceiling_db = -1.0
-room_tone_db = -42.0
+room_tone_db = -58.0   # <= -90 disables the bed entirely
 
 # tts
-backend = "mock"      # mock | cosyvoice
+backend = "retime"    # retime | f5tts | cosyvoice
 tts_url = "http://127.0.0.1:8000"
 tts_ref = "refs/ref.wav"
 tts_seed = 42
 fit_iters = 4
 
 # asr (optional)
-asr_model = "small"
+asr_model = "large-v3"   # TTS 模式下文本错=成品错，别用 small
 asr_language = "zh"

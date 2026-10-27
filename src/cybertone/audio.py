@@ -201,6 +201,75 @@ def fade(x: np.ndarray, sr: int, ms: float = 5.0, mode: str = "both") -> np.ndar
     return y
 
 
+def highpass(x: np.ndarray, sr: int, fc: float = 70.0, order: int = 2) -> np.ndarray:
+    """Kill vocoder rumble below speech. Zero-phase so no transient smear."""
+    if x.size < 32:
+        return x
+    sos = signal.butter(order, fc / (sr / 2), btype="highpass", output="sos")
+    return signal.sosfiltfilt(sos, x).astype(np.float32)
+
+
+def denoise(
+    x: np.ndarray, sr: int, strength: float = 1.0, n_fft: int = 1024, hop: int = 256, floor: float = 0.05
+) -> np.ndarray:
+    """Spectral subtraction with a percentile noise estimate.
+
+    Cheap, dependency-free, and good enough for stationary vocoder hiss. Not a
+    replacement for DeepFilterNet on real-world noise, but it does not smear speech
+    the way a brick-wall gate does.
+    """
+    from scipy.ndimage import uniform_filter1d
+    from scipy.signal import istft, stft
+
+    if x.size < n_fft * 2:
+        return x
+    _f, _t, z = stft(x, nperseg=n_fft, noverlap=n_fft - hop, boundary="zeros")
+    mag = np.abs(z)
+    phase = np.angle(z)
+
+    noise = np.percentile(mag, 12, axis=1, keepdims=True)
+    noise = uniform_filter1d(noise.ravel(), 3, mode="nearest").reshape(-1, 1)
+
+    gain = np.maximum(mag - strength * noise, floor * mag) / np.maximum(mag, 1e-10)
+    gain = np.minimum(1.0, uniform_filter1d(gain, 3, axis=1, mode="nearest"))
+
+    clean = mag * gain * np.exp(1j * phase)
+    _t, y = istft(clean, nperseg=n_fft, noverlap=n_fft - hop, boundary="zeros")
+    y = y.astype(np.float32)
+    if y.size < x.size:
+        y = np.pad(y, (0, x.size - y.size))
+    return y[: x.size]
+
+
+def noise_floor_db(x: np.ndarray, sr: int, pct: float = 10.0) -> float:
+    """Robust floor estimate: the quietest decile of 20 ms frames."""
+    n = max(1, int(0.02 * sr))
+    k = x.size // n
+    if k == 0:
+        return -120.0
+    rms = np.sqrt(np.mean(x[: k * n].astype(np.float64).reshape(k, n) ** 2, axis=1))
+    return float(20 * np.log10(max(float(np.percentile(rms, pct)), 1e-12)))
+
+
+def trim_silence(x: np.ndarray, sr: int, thresh_db: float = -40.0, keep_ms: float = 30.0) -> np.ndarray:
+    """Drop leading/trailing silence so a TTS stem reports its real spoken length."""
+    if x.size == 0:
+        return x
+    frame = max(1, int(0.02 * sr))
+    n = x.size // frame
+    if n == 0:
+        return x
+    rms = np.sqrt(np.mean(np.square(x[: n * frame].reshape(n, frame), dtype=np.float64), axis=1))
+    db = 20 * np.log10(np.maximum(rms, 1e-12))
+    loud = np.flatnonzero(db > thresh_db)
+    if loud.size == 0:
+        return x
+    keep = int(keep_ms * sr / 1000.0)
+    start = max(0, loud[0] * frame - keep)
+    end = min(x.size, (loud[-1] + 1) * frame + keep)
+    return x[start:end]
+
+
 # --------------------------------------------------------------------- WSOLA
 
 

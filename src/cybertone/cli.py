@@ -33,6 +33,13 @@ def _cfg(config: Path | None, speed: float | None, backend: str | None) -> Setti
     return cfg
 
 
+def _transcript_cache(cfg: Settings, input: Path) -> Path:
+    import hashlib
+
+    key = hashlib.sha1(f"{input.resolve()}:{input.stat().st_size}".encode()).hexdigest()[:10]
+    return cfg.work / f"transcript-{key}.json"
+
+
 def _load_triggers(cfg: Settings) -> list[Trigger]:
     path = cfg.work / "triggers.jsonl"
     if not path.exists():
@@ -80,7 +87,7 @@ def inspect(
     """Measure the material before committing to a strategy."""
     cfg = _cfg(config, speed, None)
     x, sr = audio.load(input, cfg.sr)
-    words = asr.transcribe(input, cfg, cfg.work / "transcript.json") if use_asr else None
+    words = asr.transcribe(input, cfg, _transcript_cache(cfg, input)) if use_asr else None
     trs, stats = triggers.build(x, sr, cfg, words)
     plan = allocate(trs, x.size / sr, cfg)
     _report(plan, stats)
@@ -97,7 +104,7 @@ def triggers_cmd(
     """Segment the source into sentence nodes."""
     cfg = _cfg(config, speed, None)
     x, sr = audio.load(input, cfg.sr)
-    words = asr.transcribe(input, cfg, cfg.work / "transcript.json") if use_asr else None
+    words = asr.transcribe(input, cfg, _transcript_cache(cfg, input)) if use_asr else None
     trs, stats = triggers.build(x, sr, cfg, words)
     write_jsonl(cfg.work / "triggers.jsonl", trs)
     (cfg.work / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
@@ -125,7 +132,7 @@ def plan_cmd(
 def synth_cmd(
     input: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
-    backend: Annotated[str, typer.Option("--backend", "-b")] = "mock",
+    backend: Annotated[str, typer.Option("--backend", "-b")] = "retime",
 ) -> None:
     """Render one stem per sentence."""
     cfg = _cfg(config, None, backend)
@@ -138,10 +145,12 @@ def synth_cmd(
 
 
 def _synth_all(cfg: Settings, trs: list[Trigger], plan: Plan, x, sr) -> list:
-    if cfg.backend != "mock" and cfg.tts_ref is None:
-        ref = synth.make_reference(x, sr, trs, 8.0)
+    if cfg.backend not in ("retime", "mock") and cfg.tts_ref is None:
+        ref, ref_text = synth.make_reference(x, sr, trs, 8.0, clean=cfg.clean_tts)
         cfg.tts_ref = cfg.work / "ref.wav"
         audio.save(cfg.tts_ref, ref, sr)
+        if ref_text:
+            cfg.tts_ref_text = ref_text
         console.print(f"[dim]auto reference -> {cfg.tts_ref}[/dim]")
     backend = synth.make_backend(cfg.backend, cfg, x, sr)
     stems = []
@@ -182,15 +191,23 @@ def run(
     output: Annotated[Path | None, typer.Option("--out", "-o")] = None,
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     speed: Annotated[float, typer.Option("--speed")] = 2.0,
-    backend: Annotated[str, typer.Option("--backend", "-b")] = "mock",
+    backend: Annotated[str, typer.Option("--backend", "-b")] = "retime",
     use_asr: Annotated[bool, typer.Option("--asr/--no-asr")] = False,
     baseline: Annotated[bool, typer.Option("--baseline/--no-baseline")] = False,
+    placement: Annotated[str, typer.Option("--placement", help="flow | anchor")] = "flow",
 ) -> None:
     """End-to-end: segment, plan, synthesise, stitch, mux."""
     cfg = _cfg(config, speed, backend)
+    cfg.placement = placement
+    if cfg.backend in ("retime", "mock"):
+        console.print(
+            "[yellow]backend=retime: re-times the ORIGINAL audio only.\n"
+            "No timbre transfer — the delivery (and therefore the pace you hear) is "
+            "inherited from the source. Use --backend f5tts for real resynthesis.[/yellow]"
+        )
     x, sr = audio.load(input, cfg.sr)
 
-    words = asr.transcribe(input, cfg, cfg.work / "transcript.json") if use_asr else None
+    words = asr.transcribe(input, cfg, _transcript_cache(cfg, input)) if use_asr else None
     trs, stats = triggers.build(x, sr, cfg, words)
     write_jsonl(cfg.work / "triggers.jsonl", trs)
 
@@ -251,9 +268,23 @@ def ref_cmd(
     cfg = _cfg(config, None, None)
     x, sr = audio.load(input, cfg.sr)
     trs, _ = triggers.build(x, sr, cfg, None)
-    seg = synth.make_reference(x, sr, trs, duration)
+    seg, text = synth.make_reference(x, sr, trs, duration, clean=cfg.clean_tts)
     audio.save(output, seg, sr)
     console.print(f"[green]reference[/green] {output} ({seg.size / sr:.2f}s, {audio.rms_db(seg):.1f} dBFS)")
+
+    if not text and asr.available():  # no manifest text yet, fall back to ASR
+        tmp = cfg.work / "ref_tmp.wav"
+        audio.save(tmp, seg, sr)
+        words = asr.transcribe(tmp, cfg, None)
+        text = " ".join(w.text for w in words) if words else ""
+        tmp.unlink(missing_ok=True)
+
+    if text:
+        side = Path(output).with_suffix(".txt")
+        side.write_text(text, encoding="utf-8")
+        console.print(f"[dim]prompt text -> {side}: {text}[/dim]")
+    else:
+        console.print("[yellow]no transcript available: write the .txt by hand[/yellow]")
 
 
 @app.command()
